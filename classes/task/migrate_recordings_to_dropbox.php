@@ -28,6 +28,7 @@ defined('MOODLE_INTERNAL') || die();
 
 use core\task\scheduled_task;
 use moodle_exception;
+require_once($CFG->dirroot . '/mod/zoom/locallib.php');
 
 /**
  * Migrates Zoom recording URLs in {zoom_meeting_recordings} to Dropbox links.
@@ -52,23 +53,29 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         global $DB;
 
         $config = get_config('zoom');
-        $token = $config->dropboxtoken ?? '';
-        if (empty($token)) {
+        $dropboxtoken = $config->dropboxtoken ?? '';
+        if (empty($dropboxtoken)) {
             mtrace('Skipping task - Dropbox token not configured (zoom/dropboxtoken).');
             return;
         }
 
-        // If recordings are not enabled in plugin settings, there's nothing to migrate.
         if (empty($config->viewrecordings)) {
             mtrace('Skipping task - ' . get_string('zoomerr_viewrecordings_off', 'mod_zoom'));
             return;
         }
 
+        // Try to initialise Zoom webservice (ensures credentials and token handling are correct).
+        try {
+            $service = \zoom_webservice();
+            // Force token acquisition to populate oauth cache.
+            $service->has_scope(['meeting:read:admin']);
+        } catch (\Throwable $e) {
+            mtrace('Cannot initialise Zoom webservice: ' . $e->getMessage());
+            return;
+        }
+
         // Build candidate list: recordings whose URL still points to Zoom.
-        $params = [
-            'z1' => '%zoom.%',
-            'z2' => '%zoom.us%'
-        ];
+        $params = ['z1' => '%zoom.%', 'z2' => '%zoom.us%'];
         $sql = "SELECT r.*, z.course, z.name AS zoomname\n"
              . "  FROM {zoom_meeting_recordings} r\n"
              . "  JOIN {zoom} z ON z.id = r.zoomid\n"
@@ -82,47 +89,56 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
         mtrace('Found ' . count($recs) . ' recording(s) to migrate to Dropbox...');
 
-        // Fetch Zoom API access token via plugin credentials.
-        try {
-            $zoomtoken = $this->get_zoom_access_token();
-        } catch (\Throwable $e) {
-            mtrace('Cannot obtain Zoom access token: ' . $e->getMessage());
-            return;
-        }
+        // Get current OAuth token from cache after initialisation.
+        $oauthcache = \cache::make('mod_zoom', 'oauth');
 
         $processed = 0; $skipped = 0; $failed = 0;
-
         foreach ($recs as $rec) {
             try {
                 $processed++;
                 mtrace("Processing recording id={$rec->id} meetinguuid={$rec->meetinguuid} recordingid={$rec->zoomrecordingid}");
 
+                // Ensure we have a fresh OAuth token available from cache (service already seeded it).
+                $zoomtoken = $oauthcache->get('accesstoken');
+                if (empty($zoomtoken)) {
+                    // As a fallback, poke the service again and re-read the cache.
+                    $service->has_scope(['meeting:read:admin']);
+                    $zoomtoken = $oauthcache->get('accesstoken');
+                }
+                if (empty($zoomtoken)) {
+                    throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'OAuth token unavailable');
+                }
+
+                // Fetch precise download URL and filetype for this recording id.
                 $dl = $this->get_zoom_recording_download($zoomtoken, $rec->meetinguuid, $rec->zoomrecordingid);
+                $filetype = $dl['filetype'] ?? '';
+                $dlurl = $dl['url'] ?? '';
+
                 $allowed = ['MP4', 'M4A'];
-                if (!in_array(strtoupper($dl['filetype'] ?? ''), $allowed, true)) {
+                if (!in_array(strtoupper($filetype), $allowed, true)) {
                     $skipped++;
-                    mtrace('  Skipping non-media file type: ' . ($dl['filetype'] ?? 'unknown'));
+                    mtrace('  Skipping non-media file type: ' . $filetype);
                     continue;
                 }
 
-                $filename = $this->make_filename($rec, $dl['filetype'] ?? 'mp4');
+                $filename = $this->make_filename($rec, $filetype ?: 'mp4');
                 $dropboxpath = $this->build_dropbox_path_for_recording($rec, $filename);
 
-                // Download from Zoom.
-                [$tmpfile, $size] = $this->download_zoom_to_temp($zoomtoken, $dl['url']);
+                // Download from Zoom with Bearer token.
+                [$tmpfile, $size] = $this->download_zoom_to_temp($zoomtoken, $dlurl);
                 mtrace('  Downloaded ' . round($size / (1024 * 1024), 2) . ' MB');
 
                 // Upload to Dropbox (simple/chunked based on size threshold 150MB).
                 mtrace('  Uploading to Dropbox path: ' . $dropboxpath);
                 if ($size <= 150 * 1024 * 1024) {
-                    $meta = $this->dropbox_simple_upload($token, $dropboxpath, $tmpfile);
+                    $meta = $this->dropbox_simple_upload($dropboxtoken, $dropboxpath, $tmpfile);
                 } else {
-                    $meta = $this->dropbox_chunked_upload($token, $dropboxpath, $tmpfile);
+                    $meta = $this->dropbox_chunked_upload($dropboxtoken, $dropboxpath, $tmpfile);
                 }
                 @unlink($tmpfile);
 
                 // Create or fetch a shared link and convert to a download permalink.
-                $shared = $this->dropbox_get_or_create_shared_link($token, $meta['path_lower'] ?? $dropboxpath);
+                $shared = $this->dropbox_get_or_create_shared_link($dropboxtoken, $meta['path_lower'] ?? $dropboxpath);
                 $permalink = preg_match('/[?&]dl=/', $shared) ? $shared : ($shared . (strpos($shared, '?') === false ? '?dl=1' : '&dl=1'));
 
                 // Update the DB record.
@@ -152,7 +168,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
     protected function resolve_course_section_path(int $zoomid): array {
         global $DB;
         $rec = $DB->get_record_sql(
-            "SELECT z.id as zoomid, z.name AS zoomname, c.id AS courseid, c.fullname as coursename,\n"
+            "SELECT z.id as zoomid, z.name AS zoomname, c.id AS courseid, c.fullname as coursename, c.shortname as courseshort,\n"
             . "       cs.id AS sectionid, cs.name AS sectionname, cs.section AS sectionnum\n"
             . "  FROM {zoom} z\n"
             . "  JOIN {course} c ON c.id = z.course\n"
@@ -165,106 +181,18 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         if (!$rec) {
             return ['/Unknown Course', '/Unknown Section'];
         }
-        $course = $this->sanitize_segment($rec->coursename ?? 'Course');
+        $course = $this->sanitize_segment(($rec->courseshort ?? '') !== '' ? $rec->courseshort : ($rec->coursename ?? 'Course'));
         $section = $this->sanitize_segment(($rec->sectionname ?? '') !== '' ? $rec->sectionname : ('Topic ' . (string)($rec->sectionnum ?? '')));
         return ["/{$course}", "/{$section}"];
     }
 
-    protected function get_zoom_access_token(): string {
-        $clientid = get_config('zoom', 'clientid');
-        $clientsecret = get_config('zoom', 'clientsecret');
-        $accountid = get_config('zoom', 'accountid');
-        if (empty($clientid) || empty($clientsecret) || empty($accountid)) {
-            throw new moodle_exception('error', 'mod_zoom', '', 'Zoom plugin credentials are not configured (clientid/clientsecret/accountid).');
-        }
-
-        $headers = [
-            'Authorization: Basic ' . base64_encode($clientid . ':' . $clientsecret),
-            'Accept: application/json',
-        ];
-
-        $ch = curl_init('https://zoom.us/oauth/token');
-        $fields = http_build_query([
-            'grant_type' => 'account_credentials',
-            'account_id' => $accountid,
-        ]);
-        curl_setopt_array($ch, [
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $fields,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 60,
-        ]);
-        $resp = curl_exec($ch);
-        if ($resp === false) {
-            $err = curl_error($ch);
-            curl_close($ch);
-            throw new moodle_exception('error', 'mod_zoom', '', 'Failed to get Zoom access token: ' . $err);
-        }
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        $json = json_decode($resp);
-        if ($code >= 400 || empty($json->access_token)) {
-            throw new moodle_exception('error', 'mod_zoom', '', 'Failed to get Zoom access token, HTTP ' . $code . ' response: ' . $resp);
-        }
-        return $json->access_token;
-    }
-
-    protected function get_zoom_recording_download(string $token, string $meetinguuid, string $recordingid): array {
-        $encodeduuid = (new \mod_zoom\webservice())->encode_uuid($meetinguuid);
-        $url = 'https://api.zoom.us/v2/meetings/' . $encodeduuid . '/recordings';
-
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_HTTPHEADER => [
-                'Authorization: Bearer ' . $token,
-                'Accept: application/json',
-            ],
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 120,
-        ]);
-        $resp = curl_exec($ch);
-        if ($resp === false) {
-            $err = curl_error($ch);
-            curl_close($ch);
-            throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'Zoom recordings list failed: ' . $err);
-        }
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-        if ($code >= 400) {
-            throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'Zoom recordings list HTTP ' . $code . ' => ' . $resp);
-        }
-        $json = json_decode($resp);
-        if (empty($json) || empty($json->recording_files)) {
-            throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'No recording_files for meeting uuid ' . $meetinguuid);
-        }
-        foreach ($json->recording_files as $rf) {
-            if (!empty($rf->id) && (string)$rf->id === (string)$recordingid) {
-                $download = $rf->download_url ?? null;
-                $play = $rf->play_url ?? null;
-                $filetype = $rf->file_type ?? '';
-                if (empty($download) && !empty($play)) {
-                    $download = $play;
-                }
-                if (empty($download)) {
-                    throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'Recording has no downloadable URL');
-                }
-                return [
-                    'url' => $download,
-                    'filetype' => $filetype,
-                ];
-            }
-        }
-        throw new moodle_exception('errorwebservice', 'mod_zoom', '', 'Recording id not found in meeting files');
-    }
+    // Removed custom OAuth/token calls; we use zoom_webservice() and oauth cache instead.
 
     protected function download_zoom_to_temp(string $token, string $url): array {
         $tmp = tempnam(sys_get_temp_dir(), 'zoomrec_');
         $fh = fopen($tmp, 'wb');
         if ($fh === false) {
-            throw new moodle_exception('error', 'core', '', 'Failed to open temp file for writing');
+            throw new \Exception('Failed to open temp file for writing');
         }
         $ch = curl_init($url);
         curl_setopt_array($ch, [
@@ -284,20 +212,70 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         fclose($fh);
         if ($ok === false || $code >= 400) {
             @unlink($tmp);
-            throw new moodle_exception('error', 'core', '', 'Failed to download from Zoom (HTTP ' . $code . '): ' . ($err ?? 'unknown'));
+            throw new \Exception('Zoom download failed (HTTP ' . $code . '): ' . ($err ?? 'unknown') . '; URL=' . $url);
         }
         $size = filesize($tmp);
         if ($size === false || $size === 0) {
             @unlink($tmp);
-            throw new moodle_exception('error', 'core', '', 'Downloaded file is empty');
+            throw new \Exception('Downloaded file is empty');
         }
         return [$tmp, $size];
+    }
+
+    protected function get_zoom_recording_download(string $token, string $meetinguuid, string $recordingid): array {
+        $encodeduuid = (new \mod_zoom\webservice())->encode_uuid($meetinguuid);
+        $apiurl = zoom_get_api_url();
+        $url = rtrim($apiurl, '/') . '/meetings/' . $encodeduuid . '/recordings';
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $token,
+                'Accept: application/json',
+            ],
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 120,
+        ]);
+        $resp = curl_exec($ch);
+        if ($resp === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new \Exception('Zoom recordings list failed: ' . $err);
+        }
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($code >= 400) {
+            throw new \Exception('Zoom recordings list HTTP ' . $code . ' => ' . $resp);
+        }
+        $json = json_decode($resp);
+        if (empty($json) || empty($json->recording_files)) {
+            throw new \Exception('No recording_files for meeting uuid ' . $meetinguuid);
+        }
+        foreach ($json->recording_files as $rf) {
+            if (!empty($rf->id) && (string)$rf->id === (string)$recordingid) {
+                $download = $rf->download_url ?? null;
+                $play = $rf->play_url ?? null;
+                $filetype = $rf->file_type ?? '';
+                if (empty($download) && !empty($play)) {
+                    $download = $play;
+                }
+                if (empty($download)) {
+                    throw new \Exception('Recording has no downloadable URL (id=' . $recordingid . ')');
+                }
+                return [
+                    'url' => $download,
+                    'filetype' => $filetype,
+                ];
+            }
+        }
+        throw new \Exception('Recording id not found in meeting files (id=' . $recordingid . ')');
     }
 
     protected function dropbox_simple_upload(string $token, string $path, string $filepath): array {
         $data = file_get_contents($filepath);
         if ($data === false) {
-            throw new moodle_exception('error', 'core', '', 'Failed reading temp file for Dropbox upload');
+            throw new \Exception('Failed reading temp file for Dropbox upload');
         }
         $ch = curl_init('https://content.dropboxapi.com/2/files/upload');
         $args = json_encode([
@@ -322,12 +300,12 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         if ($resp === false) {
             $err = curl_error($ch);
             curl_close($ch);
-            throw new moodle_exception('error', 'core', '', 'Dropbox upload failed: ' . $err);
+            throw new \Exception('Dropbox upload failed: ' . $err);
         }
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         if ($code >= 400) {
-            throw new moodle_exception('error', 'core', '', 'Dropbox upload HTTP ' . $code . ' => ' . $resp);
+            throw new \Exception('Dropbox upload HTTP ' . $code . ' => ' . $resp);
         }
         return json_decode($resp, true);
     }
@@ -335,7 +313,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
     protected function dropbox_chunked_upload(string $token, string $path, string $filepath, int $chunksize = 8388608): array {
         $fh = fopen($filepath, 'rb');
         if ($fh === false) {
-            throw new moodle_exception('error', 'core', '', 'Failed opening file for chunked upload');
+            throw new \Exception('Failed opening file for chunked upload');
         }
 
         // Start session.
@@ -357,13 +335,13 @@ class migrate_recordings_to_dropbox extends scheduled_task {
             $err = curl_error($ch);
             curl_close($ch);
             fclose($fh);
-            throw new moodle_exception('error', 'core', '', 'Dropbox start session failed: ' . $err);
+            throw new \Exception('Dropbox start session failed: ' . $err);
         }
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         if ($code >= 400) {
             fclose($fh);
-            throw new moodle_exception('error', 'core', '', 'Dropbox start session HTTP ' . $code . ' => ' . $resp);
+            throw new \Exception('Dropbox start session HTTP ' . $code . ' => ' . $resp);
         }
         $session = json_decode($resp, true);
         $sessionid = $session['session_id'] ?? null;
@@ -402,13 +380,13 @@ class migrate_recordings_to_dropbox extends scheduled_task {
                 $err = curl_error($ch);
                 curl_close($ch);
                 fclose($fh);
-                throw new moodle_exception('error', 'core', '', 'Dropbox append failed: ' . $err);
+                throw new \Exception('Dropbox append failed: ' . $err);
             }
             $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
             if ($code >= 400) {
                 fclose($fh);
-                throw new moodle_exception('error', 'core', '', 'Dropbox append HTTP ' . $code . ' => ' . $resp);
+                throw new \Exception('Dropbox append HTTP ' . $code . ' => ' . $resp);
             }
             $offset += strlen($chunk);
         }
@@ -446,7 +424,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         curl_close($ch);
         fclose($fh);
         if ($resp === false || $code >= 400) {
-            throw new moodle_exception('error', 'core', '', 'Dropbox finish HTTP ' . $code . ' => ' . ($resp ?: $err));
+            throw new \Exception('Dropbox finish HTTP ' . $code . ' => ' . ($resp ?: $err));
         }
         return json_decode($resp, true);
     }
@@ -505,7 +483,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
                 }
             }
         }
-        throw new moodle_exception('error', 'core', '', 'Failed to get or create Dropbox shared link: ' . $resp);
+        throw new \Exception('Failed to get or create Dropbox shared link: ' . $resp);
     }
 
     protected function build_dropbox_path_for_recording($zoomrec, string $filename): string {
@@ -514,14 +492,15 @@ class migrate_recordings_to_dropbox extends scheduled_task {
     }
 
     protected function make_filename($zoomrec, string $filetype): string {
-        $base = $this->sanitize_segment($zoomrec->name);
-        $dt = userdate($zoomrec->recordingstart, '%Y-%m-%d_%H-%M-%S', 0, false);
         $ext = strtolower($filetype);
         switch ($ext) {
             case 'mp4': $suffix = '.mp4'; break;
             case 'm4a': $suffix = '.m4a'; break;
             default: $suffix = '.bin'; break;
         }
-        return $base . '_' . $dt . '_' . substr($zoomrec->zoomrecordingid, 0, 8) . $suffix;
+        // Use recording ID to ensure uniqueness and keep names short.
+        $idpart = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)$zoomrec->zoomrecordingid);
+        if ($idpart === '') { $idpart = (string)($zoomrec->id ?? time()); }
+        return $idpart . $suffix;
     }
 }
