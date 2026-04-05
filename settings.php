@@ -134,6 +134,41 @@ if ($ADMIN->fulltree) {
     );
     $settings->add($dropboxtoken);
 
+    // Optional: Use Dropbox short-lived token flow with refresh token.
+    $dropboxappkey = new admin_setting_configtext(
+        'zoom/dropboxappkey',
+        get_string('dropboxappkey', 'mod_zoom'),
+        get_string('dropboxappkey_desc', 'mod_zoom'),
+        '',
+        PARAM_ALPHANUMEXT
+    );
+    $settings->add($dropboxappkey);
+
+    $dropboxappsecret = new admin_setting_configpasswordunmask(
+        'zoom/dropboxappsecret',
+        get_string('dropboxappsecret', 'mod_zoom'),
+        get_string('dropboxappsecret_desc', 'mod_zoom'),
+        ''
+    );
+    $settings->add($dropboxappsecret);
+
+    $dropboxrefreshtoken = new admin_setting_configpasswordunmask(
+        'zoom/dropboxrefreshtoken',
+        get_string('dropboxrefreshtoken', 'mod_zoom'),
+        get_string('dropboxrefreshtoken_desc', 'mod_zoom'),
+        ''
+    );
+    $settings->add($dropboxrefreshtoken);
+
+    // Helper link to start OAuth flow to obtain refresh token.
+    $authorizeurl = new moodle_url('/mod/zoom/dropbox_oauth.php', ['sesskey' => sesskey()]);
+    $authlinkhtml = html_writer::link($authorizeurl, get_string('dropboxauth_start', 'mod_zoom'));
+    $settings->add(new admin_setting_heading(
+        'zoom/dropboxoauthlink',
+        '',
+        $authlinkhtml
+    ));
+
     $apiidentifier = new admin_setting_configselect(
         'zoom/apiidentifier',
         get_string('apiidentifier', 'mod_zoom'),

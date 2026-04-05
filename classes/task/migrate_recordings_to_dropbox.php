@@ -53,11 +53,6 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         global $DB;
 
         $config = get_config('zoom');
-        $dropboxtoken = $config->dropboxtoken ?? '';
-        if (empty($dropboxtoken)) {
-            mtrace('Skipping task - Dropbox token not configured (zoom/dropboxtoken).');
-            return;
-        }
 
         if (empty($config->viewrecordings)) {
             mtrace('Skipping task - ' . get_string('zoomerr_viewrecordings_off', 'mod_zoom'));
@@ -91,6 +86,14 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
         // Get current OAuth token from cache after initialisation.
         $oauthcache = \cache::make('mod_zoom', 'oauth');
+        
+        // Get Dropbox access token (refreshing via refresh token if configured).
+        try {
+            $dropboxtoken = $this->get_dropbox_access_token(false);
+        } catch (\Throwable $e) {
+            mtrace('Skipping task - Dropbox token retrieval failed: ' . $e->getMessage());
+            return;
+        }
 
         $processed = 0; $skipped = 0; $failed = 0;
         foreach ($recs as $rec) {
@@ -130,15 +133,42 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
                 // Upload to Dropbox (simple/chunked based on size threshold 150MB).
                 mtrace('  Uploading to Dropbox path: ' . $dropboxpath);
-                if ($size <= 150 * 1024 * 1024) {
-                    $meta = $this->dropbox_simple_upload($dropboxtoken, $dropboxpath, $tmpfile);
-                } else {
-                    $meta = $this->dropbox_chunked_upload($dropboxtoken, $dropboxpath, $tmpfile);
+                $meta = null;
+                try {
+                    if ($size <= 150 * 1024 * 1024) {
+                        $meta = $this->dropbox_simple_upload($dropboxtoken, $dropboxpath, $tmpfile);
+                    } else {
+                        $meta = $this->dropbox_chunked_upload($dropboxtoken, $dropboxpath, $tmpfile);
+                    }
+                } catch (\Exception $ex) {
+                    // If token expired, refresh once and retry.
+                    if (strpos($ex->getMessage(), 'expired_access_token') !== false || strpos($ex->getMessage(), 'HTTP 401') !== false) {
+                        mtrace('  Dropbox token expired; refreshing and retrying upload...');
+                        $dropboxtoken = $this->get_dropbox_access_token(true);
+                        if ($size <= 150 * 1024 * 1024) {
+                            $meta = $this->dropbox_simple_upload($dropboxtoken, $dropboxpath, $tmpfile);
+                        } else {
+                            $meta = $this->dropbox_chunked_upload($dropboxtoken, $dropboxpath, $tmpfile);
+                        }
+                    } else {
+                        throw $ex;
+                    }
                 }
                 @unlink($tmpfile);
 
                 // Create or fetch a shared link and convert to a download permalink.
-                $shared = $this->dropbox_get_or_create_shared_link($dropboxtoken, $meta['path_lower'] ?? $dropboxpath);
+                $shared = null;
+                try {
+                    $shared = $this->dropbox_get_or_create_shared_link($dropboxtoken, $meta['path_lower'] ?? $dropboxpath);
+                } catch (\Exception $ex) {
+                    if (strpos($ex->getMessage(), 'expired_access_token') !== false || strpos($ex->getMessage(), 'HTTP 401') !== false) {
+                        mtrace('  Dropbox token expired while creating link; refreshing and retrying...');
+                        $dropboxtoken = $this->get_dropbox_access_token(true);
+                        $shared = $this->dropbox_get_or_create_shared_link($dropboxtoken, $meta['path_lower'] ?? $dropboxpath);
+                    } else {
+                        throw $ex;
+                    }
+                }
                 $permalink = preg_match('/[?&]dl=/', $shared) ? $shared : ($shared . (strpos($shared, '?') === false ? '?dl=1' : '&dl=1'));
 
                 // Update the DB record.
@@ -502,5 +532,72 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         $idpart = preg_replace('/[^a-zA-Z0-9_-]/', '', (string)$zoomrec->zoomrecordingid);
         if ($idpart === '') { $idpart = (string)($zoomrec->id ?? time()); }
         return $idpart . $suffix;
+    }
+
+    // -------------------- Dropbox OAuth helper -------------------- //
+
+    protected function get_dropbox_access_token(bool $forceRefresh = false): string {
+        $appkey = get_config('zoom', 'dropboxappkey') ?: '';
+        $appsecret = get_config('zoom', 'dropboxappsecret') ?: '';
+        $refreshtoken = get_config('zoom', 'dropboxrefreshtoken') ?: '';
+
+        if ($appkey !== '' && $appsecret !== '' && $refreshtoken !== '') {
+            $cache = \cache::make('mod_zoom', 'dropboxoauth');
+            $token = !$forceRefresh ? ($cache->get('accesstoken') ?: '') : '';
+            $expires = !$forceRefresh ? (int)($cache->get('expires') ?: 0) : 0;
+            if ($token === '' || $expires === 0 || time() >= $expires) {
+                [$token, $expiry] = $this->refresh_dropbox_access_token($appkey, $appsecret, $refreshtoken);
+                $cache->set_many([
+                    'accesstoken' => $token,
+                    'expires' => $expiry,
+                ]);
+            }
+            return $token;
+        }
+
+        // Fallback to legacy static token.
+        $legacy = get_config('zoom', 'dropboxtoken') ?: '';
+        if ($legacy === '') {
+            throw new \Exception('Dropbox credentials not configured. Provide app key/secret + refresh token or a static access token.');
+        }
+        return $legacy;
+    }
+
+    protected function refresh_dropbox_access_token(string $appkey, string $appsecret, string $refreshtoken): array {
+        $ch = curl_init('https://api.dropboxapi.com/oauth2/token');
+        $basic = base64_encode($appkey . ':' . $appsecret);
+        $fields = http_build_query([
+            'grant_type' => 'refresh_token',
+            'refresh_token' => $refreshtoken,
+        ]);
+        curl_setopt_array($ch, [
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Basic ' . $basic,
+                'Content-Type: application/x-www-form-urlencoded',
+            ],
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $fields,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 60,
+        ]);
+        $resp = curl_exec($ch);
+        if ($resp === false) {
+            $err = curl_error($ch);
+            curl_close($ch);
+            throw new \Exception('Dropbox token refresh failed: ' . $err);
+        }
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($code >= 400) {
+            throw new \Exception('Dropbox token refresh HTTP ' . $code . ' => ' . $resp);
+        }
+        $json = json_decode($resp, true);
+        $token = $json['access_token'] ?? '';
+        $expiresin = (int)($json['expires_in'] ?? 3600);
+        if ($token === '') {
+            throw new \Exception('Dropbox token refresh response missing access_token');
+        }
+        $expiry = time() + max(300, $expiresin - 60); // Store slightly earlier expiry to be safe.
+        return [$token, $expiry];
     }
 }

@@ -36,4 +36,9 @@ $definitions = [
         'simplekeys' => true,
         'simpledata' => true,
     ],
+    'dropboxoauth' => [
+        'mode' => cache_store::MODE_APPLICATION,
+        'simplekeys' => true,
+        'simpledata' => true,
+    ],
 ];
