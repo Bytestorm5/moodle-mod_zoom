@@ -119,6 +119,21 @@ if ($ADMIN->fulltree) {
     );
     $settings->add($proxyhost);
 
+    // Dropbox integration settings.
+    $settings->add(new admin_setting_heading(
+        'zoom/dropboxintegrationsettings',
+        get_string('dropboxintegrationsettings', 'mod_zoom'),
+        get_string('dropboxintegrationsettings_desc', 'mod_zoom')
+    ));
+
+    $dropboxtoken = new admin_setting_configpasswordunmask(
+        'zoom/dropboxtoken',
+        get_string('dropboxtoken', 'mod_zoom'),
+        get_string('dropboxtoken_desc', 'mod_zoom'),
+        ''
+    );
+    $settings->add($dropboxtoken);
+
     $apiidentifier = new admin_setting_configselect(
         'zoom/apiidentifier',
         get_string('apiidentifier', 'mod_zoom'),
