@@ -33,18 +33,23 @@ if (empty($appkey) || empty($appsecret)) {
 $state = bin2hex(random_bytes(16));
 $SESSION->mod_zoom_dropbox_state = $state;
 
+// Generate PKCE code verifier and store in session as a fallback for the callback.
+// The auth URL uses standard code flow (client_secret app), but the callback will also
+// try PKCE if the standard exchange fails.
+$codeverifier = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+$SESSION->mod_zoom_dropbox_code_verifier = $codeverifier;
+
 $redirect = new moodle_url('/mod/zoom/dropbox_oauth_callback.php');
 $redirecturi = $redirect->out(false);
 
 $params = [
-    'client_id' => $appkey,
-    'response_type' => 'code',
-    'redirect_uri' => $redirecturi,
+    'client_id'         => $appkey,
+    'response_type'     => 'code',
+    'redirect_uri'      => $redirecturi,
     'token_access_type' => 'offline',
-    'state' => $state,
+    'state'             => $state,
     // Requested scopes (optional but recommended).
     'scope' => 'files.content.write sharing.write',
 ];
 $authurl = new moodle_url('https://www.dropbox.com/oauth2/authorize', $params);
 redirect($authurl);
-*** End Patch

@@ -20,7 +20,7 @@ require_once($CFG->libdir . '/filelib.php');
 require_login();
 require_capability('moodle/site:config', context_system::instance());
 
-// Render a detailed error page with stack trace and diagnostic log.
+// Render a detailed error page with diagnostic log and stack trace.
 function mod_zoom_render_dropbox_oauth_error(string $title, string $message, string $log = '', string $trace = ''): void {
     global $PAGE, $OUTPUT;
     $PAGE->set_context(context_system::instance());
@@ -47,57 +47,83 @@ $log = '';
 
 try {
     $log .= "[1] Reading OAuth callback parameters\n";
-    $code = optional_param('code', null, PARAM_RAW);
+    $code  = optional_param('code', null, PARAM_RAW);
     $state = optional_param('state', null, PARAM_RAW);
-    $log .= "    code present: " . (!empty($code) ? 'yes' : 'no') . "\n";
-    $log .= "    state present: " . (!empty($state) ? 'yes' : 'no') . "\n";
+    $log .= "    code present:          " . (!empty($code) ? 'yes' : 'no') . "\n";
+    $log .= "    state present:         " . (!empty($state) ? 'yes' : 'no') . "\n";
     $log .= "    session state present: " . (!empty($SESSION->mod_zoom_dropbox_state) ? 'yes' : 'no') . "\n";
 
     if (empty($code) || empty($state) || empty($SESSION->mod_zoom_dropbox_state) || $state !== $SESSION->mod_zoom_dropbox_state) {
         throw new \Exception(get_string('dropboxauth_error_state', 'mod_zoom'));
     }
-    unset($SESSION->mod_zoom_dropbox_state);
+    unset($SESSION->mod_zoom_dropbox_state, $SESSION->mod_zoom_dropbox_code_verifier);
     $log .= "[2] State verified and cleared\n";
 
-    $appkey = get_config('zoom', 'dropboxappkey');
-    $appsecret = get_config('zoom', 'dropboxappsecret');
+    $appkey    = get_config('zoom', 'dropboxappkey') ?: '';
+    $appsecret = get_config('zoom', 'dropboxappsecret') ?: '';
     if (empty($appkey) || empty($appsecret)) {
         throw new \Exception(get_string('dropboxauth_error_config', 'mod_zoom'));
     }
-    $log .= "[3] App key and secret loaded from config\n";
+    $log .= "[3] App key and secret loaded\n";
 
-    // Build redirect URI - must exactly match the one used in the authorization request.
+    // redirect_uri MUST match what was sent in the authorization URL.
+    // Dropbox uses it for validation; it must be included even though no redirect happens here.
     $redirecturi = (new moodle_url('/mod/zoom/dropbox_oauth_callback.php'))->out(false);
     $log .= "[4] Redirect URI: $redirecturi\n";
 
-    // Exchange authorization code for tokens.
-    // IMPORTANT: Moodle's curl::post() sends multipart/form-data when given an array,
-    // even if you set Content-Type manually. Dropbox requires application/x-www-form-urlencoded.
-    // Always pass a pre-encoded string body via http_build_query().
-    $data = [
+    // Token exchange: confidential-client authorization_code flow.
+    // Endpoint: api.dropbox.com/oauth2/token (the OAuth endpoint; api.dropboxapi.com is for file API).
+    // All credentials in POST body as application/x-www-form-urlencoded.
+    // redirect_uri is required here even though it's only used for validation.
+    $tokenparams = [
         'grant_type'    => 'authorization_code',
         'code'          => $code,
         'redirect_uri'  => $redirecturi,
         'client_id'     => $appkey,
         'client_secret' => $appsecret,
     ];
-    $body = http_build_query($data);
-    $log .= "[5] Token exchange body built (code value omitted from log)\n";
-    $log .= "    Params: grant_type, code, redirect_uri, client_id, client_secret\n";
+    $body = http_build_query($tokenparams);
 
-    $curl = new curl();
-    $curl->setHeader('Content-Type: application/x-www-form-urlencoded');
-    $curl->setHeader('Accept: application/json');
+    // Build masked version for log: replace the values of code and client_secret only.
+    $logbody = str_replace(
+        ['code=' . $code, 'client_secret=' . $appsecret],
+        ['code=<omitted>', 'client_secret=<masked>'],
+        $body
+    );
+    $log .= "[5] Token exchange body: $logbody\n";
 
-    $log .= "[6] POSTing to https://api.dropboxapi.com/oauth2/token\n";
-    $resp = $curl->post('https://api.dropboxapi.com/oauth2/token', $body);
+    $log .= "[6] POSTing to https://api.dropbox.com/oauth2/token\n";
+    $ch = curl_init('https://api.dropbox.com/oauth2/token');
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $body,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTP_VERSION   => CURL_HTTP_VERSION_1_1,
+        CURLOPT_HTTPHEADER     => [
+            'Content-Type: application/x-www-form-urlencoded',
+            'Accept: application/json',
+            'Expect:',
+        ],
+        CURLINFO_HEADER_OUT    => true,
+        CURLOPT_TIMEOUT        => 30,
+    ]);
 
-    if ($curl->get_errno()) {
-        throw new \Exception('cURL error: ' . $curl->error);
+    $resp   = curl_exec($ch);
+    $errno  = curl_errno($ch);
+    $errmsg = curl_error($ch);
+    $info   = curl_getinfo($ch);
+    $senthdr = (string)($info['request_header'] ?? '');
+
+    $log .= "    Request headers:\n";
+    foreach (explode("\n", trim($senthdr)) as $line) {
+        $log .= "        $line\n";
     }
 
-    $info = $curl->get_info();
-    $httpcode = $info['http_code'] ?? 0;
+    if ($errno) {
+        throw new \Exception('cURL error ' . $errno . ': ' . $errmsg);
+    }
+
+    $httpcode = (int)$info['http_code'];
     $log .= "[7] HTTP response code: $httpcode\n";
     $log .= "    Response body: $resp\n";
 
@@ -108,16 +134,14 @@ try {
     $json = json_decode($resp, true);
     $refreshtoken = $json['refresh_token'] ?? '';
     if (empty($refreshtoken)) {
-        $log .= "[8] Response JSON keys: " . implode(', ', array_keys($json ?? [])) . "\n";
+        $log .= "    Response JSON keys: " . implode(', ', array_keys($json ?? [])) . "\n";
         throw new \Exception(get_string('dropboxauth_error_missing_refresh', 'mod_zoom'));
     }
     $log .= "[8] Refresh token received\n";
 
-    // Store refresh token in plugin config.
     set_config('dropboxrefreshtoken', $refreshtoken, 'zoom');
     $log .= "[9] Refresh token saved to plugin config\n";
 
-    // Success: go back to settings with a success notice.
     $redirect = new moodle_url('/admin/settings.php', ['section' => 'modsettingzoom']);
     redirect($redirect, get_string('dropboxauth_success', 'mod_zoom'));
 

@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:developers.dropbox.com)"
+      "WebFetch(domain:developers.dropbox.com)",
+      "WebFetch(domain:www.dropbox.com)",
+      "WebFetch(domain:dropbox.tech)"
     ]
   }
 }
