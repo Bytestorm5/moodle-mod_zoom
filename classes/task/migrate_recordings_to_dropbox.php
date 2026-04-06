@@ -97,6 +97,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
         $processed = 0; $skipped = 0; $failed = 0;
         foreach ($recs as $rec) {
+            $isoptional = false; // Set true for non-standard file types; failures become skips.
             try {
                 $processed++;
                 mtrace("Processing recording id={$rec->id} meetinguuid={$rec->meetinguuid} recordingid={$rec->zoomrecordingid}");
@@ -119,9 +120,8 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
                 $allowed = ['MP4', 'M4A'];
                 if (!in_array(strtoupper($filetype), $allowed, true)) {
-                    $skipped++;
-                    mtrace('  Skipping non-media file type: ' . $filetype);
-                    continue;
+                    $isoptional = true;
+                    mtrace('  Attempting non-standard file type: ' . $filetype . ' (skipped on failure)');
                 }
 
                 $filename = $this->make_filename($rec, $filetype ?: 'mp4');
@@ -178,8 +178,13 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
                 mtrace("✔ Migrated recording id={$rec->id} to Dropbox.");
             } catch (\Throwable $e) {
-                $failed++;
-                mtrace('✖ Failed recording id=' . $rec->id . ': ' . $e->getMessage());
+                if ($isoptional) {
+                    $skipped++;
+                    mtrace("  Skipped optional file id={$rec->id} ({$filetype}): " . $e->getMessage());
+                } else {
+                    $failed++;
+                    mtrace("✖ Failed recording id={$rec->id}: " . $e->getMessage());
+                }
             }
         }
 
@@ -213,7 +218,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
         }
         $course = $this->sanitize_segment(($rec->courseshort ?? '') !== '' ? $rec->courseshort : ($rec->coursename ?? 'Course'));
         $section = $this->sanitize_segment(($rec->sectionname ?? '') !== '' ? $rec->sectionname : ('Topic ' . (string)($rec->sectionnum ?? '')));
-        return ["/{$course}", "/{$section}"];
+        return ["/{$course}_{$rec->courseid}", "/{$section}_{$rec->sectionid}"];
     }
 
     // Removed custom OAuth/token calls; we use zoom_webservice() and oauth cache instead.
@@ -518,7 +523,7 @@ class migrate_recordings_to_dropbox extends scheduled_task {
 
     protected function build_dropbox_path_for_recording($zoomrec, string $filename): string {
         [$course, $section] = $this->resolve_course_section_path((int)$zoomrec->zoomid);
-        return $course . $section . '/' . $filename;
+        return '/ALASL_ARCHIVE' . $course . $section . '/' . $filename;
     }
 
     protected function make_filename($zoomrec, string $filetype): string {
@@ -564,12 +569,12 @@ class migrate_recordings_to_dropbox extends scheduled_task {
     }
 
     protected function refresh_dropbox_access_token(string $appkey, string $appsecret, string $refreshtoken): array {
-        $ch = curl_init('https://api.dropboxapi.com/oauth2/token');
+        $ch = curl_init('https://api.dropbox.com/oauth2/token');
         $basic = base64_encode($appkey . ':' . $appsecret);
         $fields = http_build_query([
             'grant_type' => 'refresh_token',
             'refresh_token' => $refreshtoken,
-        ]);
+        ], '', '&');
         curl_setopt_array($ch, [
             CURLOPT_HTTPHEADER => [
                 'Authorization: Basic ' . $basic,

@@ -82,7 +82,8 @@ try {
         'client_id'     => $appkey,
         'client_secret' => $appsecret,
     ];
-    $body = http_build_query($tokenparams);
+    // Explicitly pass '&' separator — PHP's arg_separator.output ini can default to '&amp;'.
+    $body = http_build_query($tokenparams, '', '&');
 
     // Build masked version for log: replace the values of code and client_secret only.
     $logbody = str_replace(
@@ -90,7 +91,9 @@ try {
         ['code=<omitted>', 'client_secret=<masked>'],
         $body
     );
-    $log .= "[5] Token exchange body: $logbody\n";
+    $log .= "[5] PHP arg_separator.output: '" . ini_get('arg_separator.output') . "'\n";
+    $log .= "    Body byte length: " . strlen($body) . "\n";
+    $log .= "    Token exchange body: $logbody\n";
 
     $log .= "[6] POSTing to https://api.dropbox.com/oauth2/token\n";
     $ch = curl_init('https://api.dropbox.com/oauth2/token');
